@@ -1,0 +1,562 @@
+"use client";
+/* eslint-disable @next/next/no-img-element -- Vite/Capacitor uses native lazy images, not next/image. */
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Capacitor, registerPlugin } from "@capacitor/core";
+import { ArrowClockwise, ArrowLeft, Check, CircleNotch, DownloadSimple, Eye, EyeSlash, FilmStrip, GearSix, Globe, House, LinkSimple, Magnet, MagnifyingGlass, PencilSimple, Play, Plus, Pulse, ShareNetwork, SlidersHorizontal, Star, Television, Trash, UploadSimple, X } from "@phosphor-icons/react";
+import { writeStorageTransaction, safeMobileHistory, safeMobileMetadata, androidRelease, createMobileBackup, magnetInfoHash, metadataQueries, metadataQuery, newerVersion, nextUnviewedFile, normalizeCinemeta, normalizeTorrent, normalizeTvmaze, parseMobileBackup, pickCinemeta, removeTorrentHistory, sameRelease, streamUrl, torrentFiles, updatePlaybackHistory } from "./torrserver.mjs";
+import styles from "./mobile.module.css";
+import Rutube from "./Rutube.tsx";
+import EmbeddedPlayer from "./SystemPlayer.tsx";
+import TorrentControls from "./TorrentControls.tsx";
+import EngineStorage from "./EngineStorage.tsx";
+import { Librqbit } from "./native";
+import { useTvFocus } from "./tvFocus";
+type File = {
+    id: number;
+    path: string;
+    name: string;
+    length: number;
+    season: number | null;
+    episode: number | null;
+};
+type Metadata = {
+    id: string;
+    title: string;
+    year: number | null;
+    poster: string;
+    backdrop: string;
+    description: string;
+    rating: number | null;
+    genres: string[];
+};
+type Media = {
+    hash: string;
+    title: string;
+    poster: string;
+    addedAt: number;
+    files: File[];
+    metadata?: Metadata;
+};
+type SearchItem = {
+    title: string;
+    magnet: string;
+    hash: string;
+    size: string;
+    seeders: number;
+    peers: number;
+    source: string;
+    tracker: string;
+    quality: string;
+    year: number;
+};
+type Section = "home" | "search" | "library" | "rutube" | "settings";
+type Language = "ru" | "en";
+type HistoryEntry = {
+    hash: string;
+    fileId: number;
+    fileName: string;
+    title: string;
+    positionMs: number;
+    durationMs: number;
+    completed: boolean;
+    lastPlayedAt: string;
+};
+type SystemChecks = {
+    torrserver: boolean;
+    mpv: boolean;
+    network: boolean;
+    cinemeta: boolean;
+};
+const DEFAULT_SERVER = "http://127.0.0.1:3030";
+const POPULAR_CACHE = "pirate-cinema-mobile-popular", POPULAR_TTL = 24 * 60 * 60 * 1000;
+const TONES = ["moon", "city", "sun", "forest", "ocean"];
+const MobileStorage = registerPlugin<{
+    exportBackup(options: {
+        content: string;
+        fileName: string;
+    }): Promise<{
+        ok?: boolean;
+        canceled?: boolean;
+    }>;
+    importBackup(): Promise<{
+        content?: string;
+        canceled?: boolean;
+    }>;
+}>("MobileStorage");
+const PlatformTools = registerPlugin<{
+    launchMagnet(): Promise<{
+        magnet?: string;
+    }>;
+    addListener(event: string, callback: (value: {
+        magnet: string;
+    }) => void): Promise<{
+        remove(): Promise<void>;
+    }>;
+    share(options: {
+        url: string;
+        title: string;
+    }): Promise<void>;
+    openUrl(options: {
+        url: string;
+    }): Promise<void>;
+    device(): Promise<{
+        network: boolean;
+        mpv: boolean;
+        tv: boolean;
+        subnet?: string;
+    }>;
+}>("PlatformTools");
+const TorrentSearch = registerPlugin<{
+    warmup(): Promise<{
+        updatedAt: number;
+    }>;
+    search(options: {
+        query: string;
+    }): Promise<{
+        source: string;
+        updatedAt: number;
+        results: SearchItem[];
+    }>;
+}>("TorrentSearch");
+declare const __APP_VERSION__: string;
+function cleanServer(value: string) { const url = new URL(value.trim()); if (!["http:", "https:"].includes(url.protocol))
+    throw new Error("Нужен HTTP(S)-адрес"); return url.toString().replace(/\/$/, ""); }
+function magnetTitle(value: string) { try {
+    return new URL(value).searchParams.get("dn")?.trim() || "Magnet-раздача";
+}
+catch {
+    return "Magnet-раздача";
+} }
+function formatTime(value: number) { const seconds = Math.floor(Math.max(0, value) / 1000), hours = Math.floor(seconds / 3600), minutes = Math.floor(seconds % 3600 / 60), rest = seconds % 60; return hours ? `${hours}:${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}` : `${minutes}:${String(rest).padStart(2, "0")}`; }
+function formatBytes(value: number) { if (!value)
+    return ""; const units = ["B", "KB", "MB", "GB", "TB"], power = Math.min(units.length - 1, Math.floor(Math.log(value) / Math.log(1024))); return `${(value / 1024 ** power).toFixed(power > 2 ? 1 : 0)} ${units[power]}`; }
+function popularPoster(value: string) { return value ? `https://wsrv.nl/?url=${encodeURIComponent(value)}&w=420&output=jpg&q=80` : ""; }
+export default function MobilePrototype() {
+    const [metadataAllowed, setMetadataAllowed] = useState(true);
+    const [embedded, setEmbedded] = useState<{
+        media: Media;
+        file: File;
+        position: number;
+    } | null>(null);
+    const embeddedRequest = useRef(0), embeddedRef = useRef<typeof embedded>(null), playerHistory = useRef(false);
+    async function selectEmbedded(media: Media, chosen: File, position = 0) { const request = ++embeddedRequest.current, base = `${serverUrl}/torrents/${encodeURIComponent(media.hash)}`, response = await fetch(`${base}/update_only_files`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ only_files: [chosen.id] }) }); if (!response.ok)
+        throw new Error(`Выбор файла: ${response.status}`); const started = await fetch(`${base}/start`, { method: "POST" }); if (!started.ok)
+        throw new Error(`Запуск раздачи: ${started.status}`); if (request === embeddedRequest.current) {
+        if (!embeddedRef.current) {
+            window.history.pushState({ pirateCinemaPlayer: true }, "", `${location.pathname}${location.search}#player`);
+            playerHistory.current = true;
+        }
+        embeddedRef.current = { media, file: chosen, position };
+        setEmbedded(embeddedRef.current);
+    } }
+    function closeEmbedded() { if (playerHistory.current)
+        window.history.back();
+    else {
+        embeddedRequest.current++;
+        embeddedRef.current = null;
+        setEmbedded(null);
+    } }
+    const [section, setSection] = useState<Section>("home"), [filter, setFilter] = useState("all"), [sort, setSort] = useState("added"), [genre, setGenre] = useState("all"), [season, setSeason] = useState<number | null>(null), [language, setLanguage] = useState<Language>("ru"), [welcome, setWelcome] = useState(false), [tvMode, setTvMode] = useState(false), [autoNext, setAutoNext] = useState(true), [editingMetadata, setEditingMetadata] = useState(false), [editTitle, setEditTitle] = useState(""), [query, setQuery] = useState(""), [fileQuery, setFileQuery] = useState(""), [items, setItems] = useState<Media[]>([]), [popular, setPopular] = useState<Metadata[]>([]), [metadata, setMetadata] = useState<Record<string, Metadata>>({}), [results, setResults] = useState<SearchItem[]>([]), [selected, setSelected] = useState<Media | null>(null), [file, setFile] = useState<File | null>(null), [history, setHistory] = useState<Record<string, HistoryEntry>>({}), [magnetOpen, setMagnetOpen] = useState(false), [magnet, setMagnet] = useState(""), [serverUrl, setServerUrl] = useState(DEFAULT_SERVER), [serverVersion, setServerVersion] = useState(""), [diagnostic, setDiagnostic] = useState(""), [checks, setChecks] = useState<SystemChecks | null>(null), [updateUrl, setUpdateUrl] = useState(""), [busy, setBusy] = useState(false), [error, setError] = useState(""), [toast, setToast] = useState("");
+    const historyRef = useRef<Record<string, HistoryEntry>>({});
+    const online = Boolean(serverVersion);
+    const visible = useMemo(() => items.filter(item => { const records = Object.values(history).filter(entry => entry.hash === item.hash), details = metadata[item.hash]; return item.title.toLowerCase().includes(query.toLowerCase()) && (genre === "all" || details?.genres.includes(genre)) && (filter === "all" || (filter === "movie" && item.files.length <= 1) || (filter === "series" && item.files.length > 1) || (filter === "progress" && records.some(entry => entry.positionMs > 0 && !entry.completed)) || (filter === "viewed" && records.some(entry => entry.completed))); }).sort((a, b) => sort === "title" ? a.title.localeCompare(b.title, language) : sort === "year" ? (metadata[b.hash]?.year ?? 0) - (metadata[a.hash]?.year ?? 0) : (b.addedAt - a.addedAt)), [filter, genre, history, items, language, metadata, query, sort]);
+    const historyItems = useMemo(() => Object.values(history).sort((a, b) => b.lastPlayedAt.localeCompare(a.lastPlayedAt)), [history]);
+    const continuing = historyItems.find(entry => !entry.completed && entry.positionMs > 0 && items.some(item => item.hash === entry.hash));
+    const currentHistory = selected && file ? history[`${selected.hash}:${file.id}`] : null;
+    const nextFile = selected && file && selected.files.length > 1 ? nextUnviewedFile(selected.files, history, selected.hash, file.id) : null;
+    const seasons = useMemo(() => [...new Set(selected?.files.map(value => value.season).filter((value): value is number => value !== null) ?? [])].sort((a, b) => a - b), [selected]);
+    const selectedFiles = selected?.files.filter(value => (season === null || value.season === season) && value.name.toLowerCase().includes(fileQuery.toLowerCase())) ?? [];
+    const genres = useMemo(() => [...new Set(Object.values(metadata).flatMap(value => value.genres))].sort(), [metadata]);
+    const t = (ru: string, en: string) => language === "en" ? en : ru;
+    const notify = (message: string) => { setToast(message); window.setTimeout(() => setToast(""), 2600); };
+    function saveHistory(next: Record<string, HistoryEntry>) { historyRef.current = next; setHistory(next); window.localStorage.setItem("pirate-cinema-mobile-history", JSON.stringify(next)); }
+    async function connect(value = serverUrl) { setBusy(true); setError(""); try {
+        const base = cleanServer(value);
+        const [root, response] = await Promise.all([fetch(`${base}/`), fetch(`${base}/torrents`)]);
+        if (!root.ok || !response.ok)
+            throw new Error(`librqbit ${!root.ok ? root.status : response.status}`);
+        const payload = await response.json(), listed = Array.isArray(payload) ? payload : payload?.torrents ?? [];
+        const detailed = await Promise.all(listed.map(async (raw: unknown) => { const item = normalizeTorrent(raw); if (item.files.length || !item.hash)
+            return item; const details = await fetch(`${base}/torrents/${encodeURIComponent(item.hash)}`); return details.ok ? normalizeTorrent(await details.json()) : item; }));
+        setServerUrl(base);
+        setServerVersion("librqbit 9.0.1");
+        setItems(detailed.filter((item: Media) => item.hash));
+        return true;
+    }
+    catch (reason) {
+        setServerVersion("");
+        setItems([]);
+        setError(reason instanceof Error ? reason.message : "librqbit не отвечает");
+        return false;
+    }
+    finally {
+        setBusy(false);
+    } }
+    async function loadPopular() { try {
+        const cached = JSON.parse(localStorage.getItem(POPULAR_CACHE) || "null");
+        if (cached && Number.isFinite(cached.updatedAt) && Date.now() - cached.updatedAt < POPULAR_TTL && Array.isArray(cached.items)) {
+            const next = cached.items.slice(0, 12).map(normalizeCinemeta).filter((item: Metadata) => item.id && item.title);
+            if (next.length) {
+                setPopular(next);
+                return;
+            }
+        }
+    }
+    catch { /* Refresh a malformed or expired cache. */ } localStorage.removeItem(POPULAR_CACHE); try {
+        const response = await fetch("https://v3-cinemeta.strem.io/catalog/movie/top.json");
+        if (response.ok) {
+            const next = ((await response.json()).metas ?? []).slice(0, 12).map(normalizeCinemeta).filter((item: Metadata) => item.id && item.title);
+            setPopular(next);
+            localStorage.setItem(POPULAR_CACHE, JSON.stringify({ updatedAt: Date.now(), items: next }));
+        }
+    }
+    catch { /* The local library remains usable offline. */ } }
+    useEffect(() => { const savedLanguage = window.localStorage.getItem("pirate-cinema-mobile-language") === "en" ? "en" : "ru"; let savedHistory: Record<string, HistoryEntry> = {}, savedMetadata: Record<string, Metadata> = {}; try {
+        savedHistory = safeMobileHistory(JSON.parse(window.localStorage.getItem("pirate-cinema-mobile-history") || "{}"));
+    }
+    catch {
+        savedHistory = {};
+    } try {
+        savedMetadata = safeMobileMetadata(JSON.parse(window.localStorage.getItem("pirate-cinema-mobile-metadata") || "{}"));
+    }
+    catch {
+        savedMetadata = {};
+    } queueMicrotask(async () => { localStorage.setItem("pirate-cinema-mobile-player", "system"); setAutoNext(localStorage.getItem("pirate-cinema-mobile-auto-next") !== "off"); setMetadataAllowed(localStorage.getItem('pirate-cinema-mobile-metadata-consent') !== 'no'); setLanguage(savedLanguage); setWelcome(window.localStorage.getItem("pirate-cinema-mobile-welcome") !== "done"); saveHistory(savedHistory); setMetadata(savedMetadata); try {
+        const engine = Capacitor.isNativePlatform() ? await Librqbit.initialize() : { url: DEFAULT_SERVER, version: "librqbit dev" };
+        setServerUrl(engine.url);
+        await connect(engine.url);
+    }
+    catch (reason) {
+        setError(reason instanceof Error ? reason.message : "Не удалось запустить librqbit");
+    } void loadPopular(); window.setTimeout(() => void loadPopular(), 15000); }); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    useEffect(() => { if (!Capacitor.isNativePlatform())
+        return; let active = true; const incoming = (value: {
+        magnet?: string;
+    }) => { if (active && value.magnet) {
+        setMagnet(value.magnet);
+        setMagnetOpen(true);
+    } }; const listener = PlatformTools.addListener("magnetReceived", incoming); void listener.then(() => PlatformTools.launchMagnet().then(incoming)).catch(() => { }); void PlatformTools.device().then(device => { if (active)
+        setTvMode(window.localStorage.getItem("pirate-cinema-mobile-tv") === "on" || window.localStorage.getItem("pirate-cinema-mobile-tv") !== "off" && device.tv); }).catch(() => { }); return () => { active = false; void listener.then(handle => handle.remove()).catch(() => { }); }; }, []);
+    useEffect(() => { const back = () => { if (playerHistory.current) {
+        playerHistory.current = false;
+        embeddedRequest.current++;
+        embeddedRef.current = null;
+        setEmbedded(null);
+    } }; window.addEventListener("popstate", back); return () => window.removeEventListener("popstate", back); }, []);
+    useTvFocus(tvMode, `${section}:${embedded ? "player" : "browse"}:${selected ? "detail" : "list"}:${magnetOpen ? "magnet" : "closed"}:${welcome ? "welcome" : "ready"}`);
+    function chooseLanguage(value: Language) { setLanguage(value); window.localStorage.setItem("pirate-cinema-mobile-language", value); }
+    async function finishWelcome() { window.localStorage.setItem("pirate-cinema-mobile-welcome", "done"); setWelcome(false); await connect(DEFAULT_SERVER); }
+    function chooseTvMode(value: boolean) { setTvMode(value); window.localStorage.setItem("pirate-cinema-mobile-tv", value ? "on" : "off"); }
+    async function discoverServer() { setBusy(true); try {
+        if (Capacitor.isNativePlatform())
+            await Librqbit.initialize();
+        await saveServer();
+    }
+    catch (reason) {
+        setError(reason instanceof Error ? reason.message : "Не удалось перезапустить движок");
+    }
+    finally {
+        setBusy(false);
+    } }
+    async function runSystemChecks() { setBusy(true); try {
+        const device = Capacitor.isNativePlatform() ? await PlatformTools.device() : { network: navigator.onLine, mpv: false, tv: false };
+        const [server, cinemeta] = await Promise.all([fetch(`${serverUrl}/`, { signal: AbortSignal.timeout(2500) }).then(value => value.ok).catch(() => false), fetch("https://v3-cinemeta.strem.io/catalog/movie/top.json", { signal: AbortSignal.timeout(4000) }).then(value => value.ok).catch(() => false)]);
+        setChecks({ torrserver: server, mpv: device.mpv, network: device.network, cinemeta });
+    }
+    finally {
+        setBusy(false);
+    } }
+    async function checkUpdates() { setBusy(true); setUpdateUrl(""); try {
+        const response = await fetch("https://api.github.com/repos/cyberboy1999/pirate-cinema/releases?per_page=20", { signal: AbortSignal.timeout(7000) });
+        if (!response.ok)
+            throw new Error(`GitHub ${response.status}`);
+        const releases = await response.json();
+        if (!Array.isArray(releases))
+            throw new Error(t("Некорректный ответ GitHub", "Invalid GitHub response"));
+        const available = androidRelease(releases, __APP_VERSION__);
+        if (!available) {
+            notify(t("На GitHub пока нет релиза Android с APK", "No Android release with an APK is available on GitHub yet"));
+            return;
+        }
+        if (newerVersion(String(available.release.tag_name || ""), __APP_VERSION__)) {
+            setUpdateUrl(available.asset.browser_download_url);
+            notify(`${t("Доступна версия", "Version available")} ${available.release.tag_name}`);
+        }
+        else
+            notify(t("Установлена актуальная версия Android", "You have the latest Android version"));
+    }
+    catch (reason) {
+        setError(reason instanceof Error ? reason.message : t("Не удалось проверить обновления", "Could not check for updates"));
+    }
+    finally {
+        setBusy(false);
+    } }
+    async function findMetadata(item: Media, customTitle?: string) { if (!customTitle && metadata[item.hash])
+        return metadata[item.hash]; if (!customTitle && !metadataAllowed)
+        return undefined; const queries = metadataQueries(customTitle || item.title); if (!queries.length)
+        return undefined; const save = (found: Metadata) => { setMetadata(current => { const next = { ...current, [item.hash]: found }; window.localStorage.setItem("pirate-cinema-mobile-metadata", JSON.stringify(next)); return next; }); return found; }; for (const query of queries)
+        for (const type of item.files.length > 1 ? ["series", "movie"] : ["movie", "series"]) {
+            try {
+                const response = await fetch(`https://v3-cinemeta.strem.io/catalog/${type}/top/search=${encodeURIComponent(query)}.json`, { signal: AbortSignal.timeout(8000) });
+                if (!response.ok)
+                    continue;
+                const first = pickCinemeta((await response.json()).metas, query);
+                if (!first)
+                    continue;
+                let raw = first;
+                const details = await fetch(`https://v3-cinemeta.strem.io/meta/${type}/${encodeURIComponent(first.id)}.json`, { signal: AbortSignal.timeout(8000) }).catch(() => null);
+                if (details?.ok)
+                    raw = (await details.json()).meta ?? first;
+                return save(normalizeCinemeta(raw) as Metadata);
+            }
+            catch { /* Try the next candidate. */ }
+        } if (localStorage.getItem("pirate-cinema-mobile-tvmaze-consent") !== "yes") {
+        if (!window.confirm(t("Cinemeta не нашла совпадение. Отправить название в TVmaze для резервного поиска описания?", "Cinemeta found no match. Send the title to TVmaze for fallback metadata search?")))
+            return undefined;
+        localStorage.setItem("pirate-cinema-mobile-tvmaze-consent", "yes");
+    } for (const query of queries) {
+        try {
+            const response = await fetch(`https://api.tvmaze.com/search/shows?q=${encodeURIComponent(query)}`, { signal: AbortSignal.timeout(8000) });
+            if (!response.ok)
+                continue;
+            const choices = await response.json(), first = choices.find((value: unknown) => { const show = (value as {
+                show?: {
+                    name?: string;
+                    premiered?: string;
+                };
+            })?.show; return sameRelease(`${show?.name ?? ""} ${show?.premiered?.slice(0, 4) ?? ""}`, query); });
+            if (first)
+                return save(normalizeTvmaze(first) as Metadata);
+        }
+        catch { /* Metadata is optional and the local library remains usable offline. */ }
+    } return undefined; }
+    async function open(item: Media, fileId?: number) { setBusy(true); setError(""); setDiagnostic(""); setSeason(null); setFileQuery(""); try {
+        let files = item.files;
+        if (!files.length) {
+            const response = await fetch(`${serverUrl}/torrents/${encodeURIComponent(item.hash)}`);
+            if (!response.ok)
+                throw new Error(`librqbit ${response.status}`);
+            files = torrentFiles(await response.json());
+        }
+        if (!files.length)
+            throw new Error(t("В раздаче не найдены видеофайлы", "No video files found"));
+        setSelected({ ...item, files, metadata: metadata[item.hash] });
+        void findMetadata({ ...item, files }).then(details => { if (details)
+            setSelected(current => current?.hash === item.hash ? { ...current, metadata: details } : current); });
+        setFile(files.find(value => value.id === fileId) ?? files[0]);
+    }
+    catch (reason) {
+        notify(reason instanceof Error ? reason.message : t("Не удалось получить файлы", "Could not load files"));
+    }
+    finally {
+        setBusy(false);
+    } }
+    async function correctMetadata() { if (!selected || editTitle.trim().length < 2)
+        return; if (!metadataAllowed && !window.confirm('Отправить введённое название в Cinemeta и TVmaze для поиска описания?'))
+        return; setBusy(true); try {
+        const details = await findMetadata(selected, editTitle.trim());
+        if (!details)
+            throw new Error(t("Совпадение не найдено", "No match found"));
+        setSelected({ ...selected, metadata: details });
+        setEditingMetadata(false);
+        notify(t("Карточка обновлена", "Card updated"));
+    }
+    catch (reason) {
+        setError(reason instanceof Error ? reason.message : t("Не удалось обновить карточку", "Could not update card"));
+    }
+    finally {
+        setBusy(false);
+    } }
+    async function launch(mode: "resume" | "start" = "resume") { if (!selected || !file)
+        return; const saved = history[`${selected.hash}:${file.id}`]; try {
+        await selectEmbedded(selected, file, mode === "resume" ? saved?.positionMs ?? 0 : 0);
+        setSelected(null);
+    }
+    catch (reason) {
+        notify(reason instanceof Error ? reason.message : t("Не удалось открыть внешний плеер", "Could not open external player"));
+    } }
+    async function shareStream() { if (!selected || !file)
+        return; const url = streamUrl(serverUrl, selected.hash, file); try {
+        if (Capacitor.isNativePlatform())
+            await PlatformTools.share({ url, title: selected.title });
+        else
+            await navigator.share({ title: selected.title, url });
+    }
+    catch (reason) {
+        if ((reason as Error)?.name !== "AbortError")
+            setError(t("Не удалось поделиться потоком", "Could not share stream"));
+    } }
+    async function add(value = magnet, title = magnetTitle(value), openAfter = false) { const clean = value.trim(), hash = magnetInfoHash(clean); if (!hash) {
+        setError("Нужна корректная magnet-ссылка с BTIH hash");
+        return;
+    } setBusy(true); setError(""); try {
+        const existing = items.find(item => item.hash === hash);
+        if (existing) {
+            setMagnet("");
+            setMagnetOpen(false);
+            notify(t("Раздача уже в медиатеке", "Torrent is already in the library"));
+            if (openAfter)
+                await open(existing);
+            return;
+        }
+        const similar = items.find(item => sameRelease(item.title, title));
+        if (similar && !window.confirm(t(`В медиатеке уже есть «${similar.title}». Добавить другую раздачу этого же релиза?`, `“${similar.title}” is already in the library. Add another torrent for the same release?`)))
+            return;
+        const response = await fetch(`${serverUrl}/torrents?overwrite=true`, { method: "POST", headers: { "content-type": "text/plain" }, body: clean });
+        if (!response.ok)
+            throw new Error(`librqbit ${response.status}`);
+        setMagnet("");
+        setMagnetOpen(false);
+        await connect();
+        notify(`${title}: ${t("добавлено в librqbit", "added to librqbit")}`);
+        if (openAfter) {
+            const details = await fetch(`${serverUrl}/torrents/${encodeURIComponent(hash)}`);
+            if (details.ok)
+                await open(normalizeTorrent(await details.json()));
+        }
+    }
+    catch (reason) {
+        setError(reason instanceof Error ? reason.message : "Не удалось добавить раздачу");
+    }
+    finally {
+        setBusy(false);
+    } }
+    async function addTorrentFile(file: globalThis.File) { setBusy(true); setError(""); try {
+        if (file.size > 10 * 1024 * 1024)
+            throw new Error(".torrent-файл больше 10 МБ");
+        const response = await fetch(`${serverUrl}/torrents?overwrite=true`, { method: "POST", headers: { "content-type": "application/x-bittorrent" }, body: await file.arrayBuffer() });
+        if (!response.ok)
+            throw new Error(`librqbit ${response.status}`);
+        setMagnetOpen(false);
+        await connect();
+        notify(".torrent-файл добавлен");
+    }
+    catch (reason) {
+        setError(reason instanceof Error ? reason.message : "Не удалось импортировать .torrent");
+    }
+    finally {
+        setBusy(false);
+    } }
+    async function search(value = query) { const clean = value.trim(); if (clean.length < 2)
+        return; setQuery(clean); setSection("search"); setResults([]); setError(""); setBusy(true); try {
+        if (!Capacitor.isNativePlatform())
+            throw new Error(t("Поиск RuTor доступен в Android-приложении", "RuTor search is available in the Android app"));
+        const response = await TorrentSearch.search({ query: clean });
+        setResults(response.results);
+        if (!response.results.length)
+            notify(t("Раздачи не найдены", "No torrents found"));
+    }
+    catch (reason) {
+        setError(reason instanceof Error ? reason.message : t("Поиск недоступен", "Search unavailable"));
+    }
+    finally {
+        setBusy(false);
+    } }
+    async function saveServer() { if (await connect(DEFAULT_SERVER))
+        notify("librqbit готов"); }
+    function changeViewed(viewed: boolean) { if (!selected || !file)
+        return; const key = `${selected.hash}:${file.id}`; if (!history[key]) {
+        if (!viewed)
+            return;
+        saveHistory({ ...history, [key]: { hash: selected.hash, fileId: file.id, fileName: file.name, title: selected.title, positionMs: 0, durationMs: 0, completed: true, lastPlayedAt: new Date().toISOString() } });
+    }
+    else
+        saveHistory(updatePlaybackHistory(history, key, { completed: viewed, positionMs: viewed ? 0 : history[key].positionMs })); notify(viewed ? "Отмечено как просмотренное" : "Отметка снята"); }
+    function resetProgress() { if (!selected || !file)
+        return; const key = `${selected.hash}:${file.id}`; saveHistory(updatePlaybackHistory(history, key, { positionMs: 0, completed: false })); notify("Позиция сброшена"); }
+    async function remove(item: Media) { if (!window.confirm(`Удалить «${item.title}» из librqbit?`))
+        return; const deleteData = window.confirm("Удалить также загруженные файлы этой раздачи и освободить место? Отмена — убрать только из списка, файлы останутся."); setBusy(true); try {
+        const response = await fetch(`${serverUrl}/torrents/${encodeURIComponent(item.hash)}/${deleteData ? "delete" : "forget"}`, { method: "POST" });
+        if (!response.ok)
+            throw new Error(`librqbit ${response.status}`);
+        saveHistory(removeTorrentHistory(history, item.hash));
+        setSelected(null);
+        await connect();
+        notify(deleteData ? "Раздача и её загруженные файлы удалены" : "Раздача удалена, данные сохранены");
+    }
+    catch (reason) {
+        setError(reason instanceof Error ? reason.message : "Не удалось удалить раздачу");
+    }
+    finally {
+        setBusy(false);
+    } }
+    async function diagnose() { if (!selected || !file)
+        return; setDiagnostic("Проверка…"); try {
+        const [root, details] = await Promise.all([fetch(`${serverUrl}/`), fetch(`${serverUrl}/torrents/${encodeURIComponent(selected.hash)}`)]);
+        if (!root.ok || !details.ok)
+            throw new Error(`librqbit ${!root.ok ? root.status : details.status}`);
+        const found = torrentFiles(await details.json()).some(value => value.id === file.id);
+        setDiagnostic(found ? `Готово: файл #${file.id} доступен через Range-поток librqbit` : `Ошибка: файл #${file.id} отсутствует в раздаче`);
+    }
+    catch (reason) {
+        setDiagnostic(reason instanceof Error ? reason.message : "Проверка не удалась");
+    } }
+    async function exportBackup() { try {
+        const content = createMobileBackup({ serverUrl, player: "system", history, metadata, rutube: JSON.parse(localStorage.getItem('pirate-cinema-mobile-rutube') || '[]'), rutubeQueue: JSON.parse(localStorage.getItem('pirate-cinema-mobile-rutube-queue') || '[]'), rutubePlaylists: JSON.parse(localStorage.getItem('pirate-cinema-mobile-rutube-playlists') || '[]') });
+        const result = await MobileStorage.exportBackup({ content, fileName: `pirate-cinema-${new Date().toISOString().slice(0, 10)}.json` });
+        if (result.ok)
+            notify("Резервная копия сохранена");
+    }
+    catch (reason) {
+        setError(reason instanceof Error ? reason.message : "Не удалось сохранить копию");
+    } }
+    function currentBackup() { return createMobileBackup({ serverUrl, player: "system", history, metadata, rutube: JSON.parse(localStorage.getItem("pirate-cinema-mobile-rutube") || "[]"), rutubeQueue: JSON.parse(localStorage.getItem("pirate-cinema-mobile-rutube-queue") || "[]"), rutubePlaylists: JSON.parse(localStorage.getItem("pirate-cinema-mobile-rutube-playlists") || "[]") }); }
+    async function restoreBackup(content: string) { const data = parseMobileBackup(content); if (!window.confirm("Восстановить историю, описания и RuTube? Текущие данные сохранятся в страховочной копии."))
+        return; const base = Capacitor.isNativePlatform() ? DEFAULT_SERVER : cleanServer(data.serverUrl); const changes: Record<string, string> = { "pirate-cinema-mobile-pre-restore-backup": currentBackup(), "pirate-cinema-mobile-player": "system", "pirate-cinema-mobile-history": JSON.stringify(data.history), "pirate-cinema-mobile-metadata": JSON.stringify(data.metadata), "pirate-cinema-mobile-server": base }; if (data.schema === 2) {
+        changes["pirate-cinema-mobile-rutube"] = JSON.stringify(data.rutube);
+        changes["pirate-cinema-mobile-rutube-queue"] = JSON.stringify(data.rutubeQueue);
+        changes["pirate-cinema-mobile-rutube-playlists"] = JSON.stringify(data.rutubePlaylists);
+    } writeStorageTransaction(localStorage, changes); saveHistory(data.history); setMetadata(data.metadata); setServerUrl(base); await connect(base); notify("Резервная копия восстановлена"); }
+    async function importBackup() { try {
+        const result = await MobileStorage.importBackup();
+        if (result.content)
+            await restoreBackup(result.content);
+    }
+    catch (reason) {
+        setError(reason instanceof Error ? reason.message : "Некорректная резервная копия");
+    } }
+    async function restoreSafetyBackup() { try {
+        const content = localStorage.getItem("pirate-cinema-mobile-pre-restore-backup");
+        if (!content)
+            throw new Error("Страховочной копии пока нет");
+        await restoreBackup(content);
+    }
+    catch (reason) {
+        setError(reason instanceof Error ? reason.message : "Не удалось восстановить страховочную копию");
+    } }
+    function clearHistory() { if (!window.confirm("Удалить всю историю просмотра и кеш описаний?"))
+        return; saveHistory({}); setMetadata({}); window.localStorage.removeItem("pirate-cinema-mobile-metadata"); notify("Локальная история очищена"); }
+    function navigate(next: Section) { setSection(next); setQuery(""); setError(""); if (next === "search" && Capacitor.isNativePlatform())
+        void TorrentSearch.warmup().catch(() => { }); }
+    const status = <button className={styles.server} onClick={() => connect()}><span>{busy ? <CircleNotch className={styles.spin} size={22}/> : online ? <Check size={22} weight="bold"/> : <X size={22}/>}</span><div><strong>{online ? t("librqbit готов", "librqbit ready") : t("librqbit недоступен", "librqbit unavailable")}</strong><small>{online ? `${items.length} ${t("раздач", "torrents")} · ${serverVersion}` : serverUrl}</small></div></button>;
+    const mediaList = (list: Media[]) => <div className={styles.list}>{list.map((item, index) => { const saved = historyItems.find(entry => entry.hash === item.hash), records = Object.values(history).filter(entry => entry.hash === item.hash), viewed = records.filter(entry => entry.completed).length, size = formatBytes(item.files.reduce((sum, value) => sum + value.length, 0)), poster = metadata[item.hash]?.poster || item.poster; return <article key={item.hash}><button className={`${styles.thumb} ${styles[TONES[index % TONES.length]]}`} style={poster ? { backgroundImage: `url(${poster})` } : undefined} onClick={() => open(item, saved?.fileId)} aria-label={`${t("Открыть", "Open")} ${item.title}`}><Play size={22} weight="fill"/></button><button className={styles.info} onClick={() => open(item, saved?.fileId)}><strong>{metadata[item.hash]?.title || item.title}</strong><small>{saved && !saved.completed && saved.positionMs > 0 ? `${t("Продолжить с", "Resume at")} ${formatTime(saved.positionMs)}` : item.files.length > 1 ? `${viewed}/${item.files.length} ${t("просмотрено", "watched")} · ${size}` : records.some(entry => entry.completed) ? t("Просмотрено", "Watched") : [metadata[item.hash]?.year, size].filter(Boolean).join(" · ") || t("Получить данные", "Load details")}</small>{saved && saved.durationMs > 0 && <i className={styles.historyProgress}><b style={{ width: `${saved.completed ? 100 : Math.min(100, saved.positionMs / saved.durationMs * 100)}%` }}/></i>}</button><div className={styles.cardActions}><button onClick={() => open(item, saved?.fileId)} aria-label={`${t("Воспроизвести", "Play")} ${item.title}`}><Play size={17} weight="fill"/></button><button onClick={() => remove(item)} aria-label={`${t("Удалить", "Delete")} ${item.title}`}><Trash size={17}/></button></div></article>; })}</div>;
+    if (embedded)
+        return <main className={`${styles.stage} ${tvMode ? styles.tvMode : ""}`}><section className={`${styles.phone} ${styles.playerPage}`}><header className={styles.playerHeader}><button onClick={closeEmbedded}><ArrowLeft size={22}/>{t("Назад", "Back")}</button></header><div className={styles.playerContent}><h1 title={embedded.media.title}>{embedded.media.metadata?.title || embedded.media.title}</h1><EmbeddedPlayer key={`${embedded.media.hash}:${embedded.file.id}`} url={streamUrl(serverUrl, embedded.media.hash, embedded.file)} title={embedded.file.name} position={embedded.position / 1000} episodes={embedded.media.files.map(value => ({ id: value.id, name: value.name }))} episodeId={embedded.file.id} autoNext={autoNext} onEpisode={id => { const chosen = embedded.media.files.find(value => value.id === id); if (chosen)
+            void selectEmbedded(embedded.media, chosen, history[`${embedded.media.hash}:${chosen.id}`]?.positionMs ?? 0).catch(reason => setError(String(reason))); }} onAutoNext={enabled => { setAutoNext(enabled); localStorage.setItem("pirate-cinema-mobile-auto-next", enabled ? "on" : "off"); }} onProgress={(position, duration, completed) => { const key = `${embedded.media.hash}:${embedded.file.id}`, next = { ...historyRef.current, [key]: { hash: embedded.media.hash, fileId: embedded.file.id, fileName: embedded.file.name, title: embedded.media.title, positionMs: completed ? 0 : position * 1000, durationMs: duration * 1000, completed, lastPlayedAt: new Date().toISOString() } }; saveHistory(next); if (completed && autoNext) {
+            const following = nextUnviewedFile(embedded.media.files, next, embedded.media.hash, embedded.file.id);
+            if (following)
+                void selectEmbedded(embedded.media, following, next[`${embedded.media.hash}:${following.id}`]?.positionMs ?? 0).catch(reason => setError(String(reason)));
+        } }}/><p className={styles.playerDescription}>{embedded.media.metadata?.description || t("Описание пока недоступно", "Description is not available yet")}</p><TorrentControls base={serverUrl} hash={embedded.media.hash}/></div>{error && <div className={styles.error} role="alert"><X size={18}/>{error}</div>}</section></main>;
+    return <main className={`${styles.stage} ${tvMode ? styles.tvMode : ""}`}><section className={styles.phone}>
+    <header className={styles.header}><h1>Pirate Cinema</h1><button className={styles.status} onClick={() => connect()}><i className={online ? "" : styles.offline}/>{online ? serverVersion : t("Не подключён", "Offline")}</button></header>
+    {section === "rutube" && <Rutube english={language === "en"}/>}
+    {section === "home" && <section className={styles.home}><div className={styles.hero}><span>{t("ЛОКАЛЬНЫЙ КИНОТЕАТР", "LOCAL CINEMA")}</span><h2>{items.length ? t("Всё готово к просмотру", "Ready to watch") : t("Добавьте первый фильм", "Add your first movie")}</h2><p>{items.length ? `${t("В librqbit сохранено", "Saved in librqbit")}: ${items.length}. ${t("Выберите недавнюю раздачу или найдите новую.", "Choose a recent torrent or find a new one.")}` : t("Найдите раздачу через каталог или вставьте magnet-ссылку.", "Find a torrent through the catalog or paste a magnet link.")}</p><div><button onClick={() => navigate("search")}><MagnifyingGlass size={19}/>{t("Найти фильм", "Find a movie")}</button><button onClick={() => setMagnetOpen(true)}><Magnet size={19}/>Magnet</button></div></div>{continuing && <button className={styles.continueCard} onClick={() => { const item = items.find(value => value.hash === continuing.hash); if (item)
+        void open(item, continuing.fileId); }}><span><Play size={22} weight="fill"/></span><div><small>{t("ПРОДОЛЖИТЬ ПРОСМОТР", "CONTINUE WATCHING")}</small><strong>{continuing.title}</strong><em>{continuing.fileName} · {formatTime(continuing.positionMs)}</em></div></button>}{items.length ? <><div className={styles.sectionTitle}><strong>{t("Недавно добавленные", "Recently added")}</strong><button onClick={() => navigate("library")}>{t("Все", "All")}</button></div>{mediaList(items.slice(0, continuing ? 2 : 3))}</> : <div className={styles.emptyHome}><FilmStrip size={30}/><strong>{t("Медиатека пока пуста", "Your library is empty")}</strong><span>{t("Поиск по каталогу уже доступен внутри приложения.", "Catalog search is available inside the app.")}</span></div>}{popular.length > 0 && <><div className={styles.sectionTitle}><strong>{t("Популярное", "Popular")}</strong><small>Cinemeta</small></div><div className={styles.popular}>{popular.map(movie => <button key={movie.id} onClick={() => void search(movie.title)}><span>{movie.poster && <img src={popularPoster(movie.poster)} loading="lazy" decoding="async" referrerPolicy="no-referrer" alt=""/>}{movie.rating && <i><Star size={11} weight="fill"/>{movie.rating.toFixed(1)}</i>}</span><strong>{movie.title}</strong><small>{movie.year ?? "—"}</small></button>)}</div></>}</section>}
+    {section === "search" && <section className={`${styles.page} ${styles.searchPage}`}><form className={styles.search} onSubmit={event => { event.preventDefault(); if (!busy)
+        void search(); }}><MagnifyingGlass size={23}/><input enterKeyHint="search" value={query} onChange={event => setQuery(event.target.value)} placeholder={t("Название фильма или сериала", "Movie or series title")}/><button type="submit" disabled={busy} aria-label={t("Найти", "Search")}>{busy ? <CircleNotch className={styles.spin} size={18}/> : <Play size={18} weight="fill"/>}</button></form><div className={styles.results}>{busy && <p role="status">{t("Загружаем каталог… На медленном устройстве первый поиск может занять несколько минут.", "Loading catalog… On a slow device the first search may take several minutes.")}</p>}{!busy && results.length === 0 && <p>{t("Введите название и нажмите «Найти»", "Enter a title and press Search")}</p>}{results.map((item, index) => <article key={`${item.hash}-${index}`}><div><strong>{item.title}</strong><small>{[item.quality, item.year || null, item.size, `${item.seeders} ${t("сидов", "seeds")}`].filter(Boolean).join(" · ")}</small></div><span className={styles.resultActions}><button disabled={busy} onClick={() => add(item.magnet, item.title)}><Plus size={17}/>{t("Добавить", "Add")}</button><button disabled={busy} onClick={() => add(item.magnet, item.title, true)}><Play size={17} weight="fill"/>{t("Смотреть", "Watch")}</button></span></article>)}</div></section>}
+    {section === "library" && <section className={styles.page}><div className={styles.titleRow}><div><span className={styles.eyebrow}>{t("МЕДИАТЕКА", "LIBRARY")}</span><h2>{t("Сохранённые раздачи", "Saved torrents")}</h2></div><button onClick={() => connect()} aria-label={t("Обновить медиатеку", "Refresh library")}><ArrowClockwise className={busy ? styles.spin : ""} size={20}/></button></div><div className={styles.search}><MagnifyingGlass size={23}/><input enterKeyHint="search" value={query} onChange={event => setQuery(event.target.value)} placeholder={t("Фильтр по названию", "Filter by title")}/>{query && <button onClick={() => setQuery("")}><X size={18}/></button>}</div><div className={styles.filters}><button className={filter === "all" ? styles.chosen : ""} onClick={() => setFilter("all")}>{t("Все", "All")}</button><button className={filter === "movie" ? styles.chosen : ""} onClick={() => setFilter("movie")}>{t("Фильмы", "Movies")}</button><button className={filter === "series" ? styles.chosen : ""} onClick={() => setFilter("series")}>{t("Сериалы", "Series")}</button><button className={filter === "progress" ? styles.chosen : ""} onClick={() => setFilter("progress")}>{t("В процессе", "In progress")}</button><button className={filter === "viewed" ? styles.chosen : ""} onClick={() => setFilter("viewed")}>{t("Просмотрено", "Watched")}</button></div><div className={styles.libraryControls}><select value={sort} onChange={event => setSort(event.target.value)}><option value="added">{t("Сначала новые", "Recently added")}</option><option value="title">{t("По названию", "By title")}</option><option value="year">{t("По году", "By year")}</option></select><select value={genre} onChange={event => setGenre(event.target.value)}><option value="all">{t("Все жанры", "All genres")}</option>{genres.map(value => <option key={value} value={value}>{value}</option>)}</select></div>{visible.length ? mediaList(visible) : <p className={styles.empty}>{t("Подходящих раздач нет", "No matching torrents")}</p>}</section>}
+    {section === "settings" && <section className={styles.settings}><span className={styles.eyebrow}>{t("НАСТРОЙКИ", "SETTINGS")}</span><h2>{t("Подключение", "Connection")}</h2>{status}<h3>{t("Язык приложения", "App language")}</h3><div className={styles.language}><button className={language === "ru" ? styles.chosen : ""} onClick={() => chooseLanguage("ru")}>Русский</button><button className={language === "en" ? styles.chosen : ""} onClick={() => chooseLanguage("en")}>English</button></div><label>{t("Локальный адрес потока", "Local stream address")}<input value={serverUrl} onChange={event => setServerUrl(event.target.value)}/></label><button className={styles.check} disabled={busy} onClick={saveServer}>{busy ? <CircleNotch className={styles.spin} size={19}/> : <LinkSimple size={19}/>} {t("Сохранить и проверить", "Save and check")}</button><button className={styles.check} disabled={busy} onClick={discoverServer}><MagnifyingGlass size={19}/>{t("Перезапустить встроенный движок", "Restart embedded engine")}</button><h3>{t("Режим экрана", "Screen mode")}</h3><div className={styles.language}><button className={!tvMode ? styles.chosen : ""} onClick={() => chooseTvMode(false)}>{t("Телефон", "Phone")}</button><button className={tvMode ? styles.chosen : ""} onClick={() => chooseTvMode(true)}><Television size={16}/>{t("Android TV", "Android TV")}</button></div><h3>{t("Диагностика", "Diagnostics")}</h3><button className={styles.check} disabled={busy} onClick={runSystemChecks}><Pulse size={19}/>{t("Проверить систему", "Check system")}</button>{checks && <div className={styles.systemChecks}>{[["librqbit", checks.torrserver], ["mpv-android", checks.mpv], [t("Сеть", "Network"), checks.network], ["Cinemeta", checks.cinemeta]].map(([label, ok]) => <span key={String(label)} className={ok ? styles.ok : styles.failed}>{ok ? <Check size={16}/> : <X size={16}/>} {String(label)}</span>)}</div>}<h3>{t("Обновления", "Updates")}</h3><button className={styles.check} disabled={busy} onClick={checkUpdates}><Globe size={19}/>{t("Проверить GitHub", "Check GitHub")}</button>{updateUrl && <button className={styles.primary} onClick={() => PlatformTools.openUrl({ url: updateUrl })}><DownloadSimple size={19}/>{t("Скачать новый APK", "Download new APK")}</button>}
+<h3>{t("Воспроизведение", "Playback")}</h3><p>{t("Видео открывается через системный выбор плеера Android.", "Video opens through the Android system player chooser.")}</p>
+<EngineStorage /><h3>{t("Приватность", "Privacy")}</h3><label><input type="checkbox" checked={metadataAllowed} onChange={event => { setMetadataAllowed(event.target.checked); localStorage.setItem("pirate-cinema-mobile-metadata-consent", event.target.checked ? "yes" : "no"); }}/>{t("Разрешить отправку названий торрентов в Cinemeta для описаний", "Allow sending torrent titles to Cinemeta for metadata")}</label><h3>{t("Локальные данные", "Local data")}</h3><div className={styles.maintenance}><button onClick={exportBackup}><DownloadSimple size={19}/><span><strong>{t("Создать копию", "Create backup")}</strong><small>{t("История, настройки, описания и RuTube", "History, settings, metadata and RuTube")}</small></span></button><button onClick={importBackup}><UploadSimple size={19}/><span><strong>{t("Восстановить", "Restore")}</strong><small>{t("Выбрать JSON-файл", "Choose a JSON file")}</small></span></button><button onClick={restoreSafetyBackup}>{t("Отменить последнее восстановление", "Undo last restore")}</button><button className={styles.danger} onClick={clearHistory}><Trash size={19}/><span><strong>{t("Очистить историю", "Clear history")}</strong><small>{t("Медиатека librqbit останется", "librqbit library stays intact")}</small></span></button></div><p className={styles.version}>Pirate Cinema {__APP_VERSION__} · Android</p></section>}
+    {(section === "rutube" || section === "library") && <button className={styles.fab} onClick={() => { setError(""); setMagnetOpen(true); }} aria-label="Добавить magnet-ссылку"><Plus size={27}/></button>}
+    <nav className={styles.nav}><button aria-current={section === "rutube" ? "page" : undefined} className={section === "rutube" ? styles.current : ""} onClick={() => navigate("rutube")}><Play size={23}/>RuTube</button><button aria-current={section === "home" ? "page" : undefined} className={section === "home" ? styles.current : ""} onClick={() => navigate("home")}><House size={23} weight={section === "home" ? "fill" : "regular"}/>{t("Главная", "Home")}</button><button aria-current={section === "search" ? "page" : undefined} className={section === "search" ? styles.current : ""} onClick={() => navigate("search")}><MagnifyingGlass size={23}/>{t("Поиск", "Search")}</button><button aria-current={section === "library" ? "page" : undefined} className={section === "library" ? styles.current : ""} onClick={() => navigate("library")}><FilmStrip size={23}/>{t("Медиатека", "Library")}</button><button aria-current={section === "settings" ? "page" : undefined} className={section === "settings" ? styles.current : ""} onClick={() => navigate("settings")}><GearSix size={23}/>{t("Настройки", "Settings")}</button></nav>
+    {selected && file && <div className={styles.overlay}><button className={styles.backdrop} onClick={() => { setSelected(null); setEditingMetadata(false); }} aria-label={t("Закрыть выбор плеера", "Close player selection")}/><section className={styles.sheet}><button className={styles.close} onClick={() => { setSelected(null); setEditingMetadata(false); }}><X size={22}/></button><span className={styles.eyebrow}>{t("ВОСПРОИЗВЕДЕНИЕ", "PLAYBACK")}</span><h2>{selected.metadata?.title || selected.title}</h2>{selected.metadata && <div className={styles.metadata}>{selected.metadata.poster && <span className={styles.metadataPoster} style={{ backgroundImage: `url(${selected.metadata.poster})` }}/>}<div><small>{[selected.metadata.year, selected.metadata.rating && `★ ${selected.metadata.rating.toFixed(1)}`, selected.metadata.genres.slice(0, 2).join(" · ")].filter(Boolean).join(" · ")}</small>{selected.metadata.description && <p>{selected.metadata.description}</p>}</div></div>}{editingMetadata && <div className={styles.metadataEdit}><input value={editTitle} onChange={event => setEditTitle(event.target.value)} placeholder={t("Точное название фильма или сериала", "Exact movie or series title")}/><button onClick={() => setEditingMetadata(false)}>{t("Отмена", "Cancel")}</button><button disabled={busy || editTitle.trim().length < 2} onClick={correctMetadata}>{t("Найти", "Find")}</button></div>}{seasons.length > 1 && <div className={styles.seasons}><button className={season === null ? styles.chosen : ""} onClick={() => setSeason(null)}>{t("Все", "All")}</button>{seasons.map(value => <button key={value} className={season === value ? styles.chosen : ""} onClick={() => { setSeason(value); setFile(selected.files.find(item => item.season === value) ?? file); }}>{t("Сезон", "Season")} {value}</button>)}</div>}{selected.files.length > 6 && <div className={styles.fileSearch}><MagnifyingGlass size={18}/><input value={fileQuery} onChange={event => setFileQuery(event.target.value)} placeholder={t("Найти серию или файл", "Find episode or file")}/></div>}<label>{t("Файл", "File")}<select value={file.id} onChange={event => { setDiagnostic(""); const chosen = selected.files.find(item => item.id === Number(event.target.value)) ?? selected.files[0]; setFile(chosen); setSeason(chosen.season); }}>{selectedFiles.map(value => { const saved = history[`${selected.hash}:${value.id}`], episode = value.season !== null && value.episode !== null ? `S${String(value.season).padStart(2, "0")}E${String(value.episode).padStart(2, "0")} · ` : ""; return <option key={value.id} value={value.id}>{episode}{value.name}{saved ? ` · ${saved.completed ? t("просмотрено", "watched") : formatTime(saved.positionMs)}` : ""}</option>; })}</select></label>{currentHistory && <p className={styles.resumeInfo}>{currentHistory.completed ? t("Файл просмотрен", "File watched") : `${t("Остановились на", "Stopped at")} ${formatTime(currentHistory.positionMs)} ${t("из", "of")} ${formatTime(currentHistory.durationMs)}`}</p>}<div className={styles.historyActions}><button onClick={() => changeViewed(!currentHistory?.completed)}>{currentHistory?.completed ? <EyeSlash size={16}/> : <Eye size={16}/>} {currentHistory?.completed ? t("Не просмотрено", "Unwatched") : t("Просмотрено", "Watched")}</button>{currentHistory && currentHistory.positionMs > 0 && <button onClick={resetProgress}><ArrowClockwise size={16}/>{t("Сбросить позицию", "Reset position")}</button>}<button onClick={() => { setEditTitle(selected.metadata?.title || metadataQuery(selected.title)); setEditingMetadata(true); }}><PencilSimple size={16}/>{t("Исправить карточку", "Fix metadata")}</button><button onClick={diagnose}><Pulse size={16}/>{t("Диагностика", "Diagnostics")}</button><button className={styles.danger} onClick={() => remove(selected)}><Trash size={16}/>{t("Удалить", "Delete")}</button></div>{diagnostic && <p className={styles.diagnostic}>{diagnostic}</p>}
+<div className={styles.playActions}>{nextFile && <button className={styles.secondary} onClick={() => { setFile(nextFile); setSeason(nextFile.season); }}>{t("Следующая непросмотренная", "Next unwatched")}</button>}{currentHistory && !currentHistory.completed && currentHistory.positionMs > 0 && <button className={styles.primary} onClick={() => launch("resume")}><Play size={19} weight="fill"/>{t("Продолжить с", "Resume at")} {formatTime(currentHistory.positionMs)}</button>}<button className={currentHistory && !currentHistory.completed && currentHistory.positionMs > 0 ? styles.secondary : styles.primary} onClick={() => launch("start")}><Play size={19} weight="fill"/>{currentHistory ? t("Сначала", "Start over") : t("Воспроизвести", "Play")}</button></div></section></div>}
+    {selected && file && <div className={styles.streamActions}><button onClick={shareStream}><ShareNetwork size={17}/>{t("Поделиться", "Share")}</button><button onClick={() => launch("resume")}><SlidersHorizontal size={17}/>{t("Выбрать плеер", "Choose player")}</button></div>}
+    {magnetOpen && <div className={styles.overlay}><button className={styles.backdrop} onClick={() => setMagnetOpen(false)} aria-label="Закрыть добавление раздачи"/><section className={styles.sheet}><button className={styles.close} onClick={() => setMagnetOpen(false)}><X size={22}/></button><span className={styles.eyebrow}>LIBRQBIT</span><h2>Добавить раздачу</h2><label>Magnet-ссылка<textarea value={magnet} onChange={event => setMagnet(event.target.value)} placeholder="magnet:?xt=urn:btih:…"/></label><button className={styles.primary} disabled={busy} onClick={() => add()}><Magnet size={19}/>Добавить magnet</button><label className={styles.secondary}>Открыть .torrent<input type="file" accept=".torrent,application/x-bittorrent" hidden onChange={event => { const chosen = event.target.files?.[0]; if (chosen)
+        void addTorrentFile(chosen); event.currentTarget.value = ""; }}/></label></section></div>}
+    {welcome && <div className={styles.welcome}><div><span className={styles.welcomeLogo}><Play size={28} weight="fill"/></span><small>PIRATE CINEMA</small><h2>{t("Добро пожаловать", "Welcome")}</h2><p>{t("Встроенный librqbit запускается автоматически. Выберите предпочитаемый плеер.", "Embedded librqbit starts automatically. Choose your preferred player.")}</p><h3>{t("Язык", "Language")}</h3><div className={styles.language}><button className={language === "ru" ? styles.chosen : ""} onClick={() => chooseLanguage("ru")}>Русский</button><button className={language === "en" ? styles.chosen : ""} onClick={() => chooseLanguage("en")}>English</button></div><label>{t("Локальный адрес потока", "Local stream address")}<input value={serverUrl} onChange={event => setServerUrl(event.target.value)}/></label>
+<button className={styles.primary} disabled={busy} onClick={finishWelcome}>{busy ? <CircleNotch className={styles.spin} size={19}/> : <Check size={19}/>} {t("Начать", "Get started")}</button></div></div>}
+    {error && <div className={styles.error} role="alert"><X size={18}/>{error}</div>}{toast && <div className={styles.toast}><Check size={18}/>{toast}</div>}
+  </section></main>;
+}

@@ -1,0 +1,31 @@
+{
+  "name": "pirate-cinema-android",
+  "version": "0.6.1",
+  "private": true,
+  "license": "GPL-3.0-only",
+  "engines": {"node": ">=22.13.0"},
+  "scripts": {
+    "mobile:build": "vite build --config vite.mobile.config.ts",
+    "mobile:typecheck": "tsc --project tsconfig.mobile.json --noEmit",
+    "android:sync": "pnpm run mobile:build && node node_modules/@capacitor/cli/bin/capacitor sync android",
+    "android:apk": "pnpm run android:sync && cd android && gradlew.bat assembleDebug",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@capacitor/android": "8.5.2",
+    "@capacitor/core": "8.5.2",
+    "@phosphor-icons/react": "2.1.10",
+    "@vitejs/plugin-react": "6.0.2",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "vite": "8.1.6"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "8.5.2",
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "typescript": "5.9.3"
+  },
+  "type": "module"
+}

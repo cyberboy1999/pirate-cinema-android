@@ -1,0 +1,15 @@
+node_modules/
+dist-mobile/
+release-local/
+_secrets/
+local-builds/
+android/.gradle/
+android/build/
+android/**/build/
+android/**/target/
+*.apk
+*.aab
+*.tsbuildinfo
+*.p12
+signing-credential.xml
+
