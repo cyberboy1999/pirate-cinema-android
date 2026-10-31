@@ -247,7 +247,7 @@ test("Android TV uses a full-screen rail and spatial D-pad navigation",()=>{
   assert.doesNotMatch(page,/\?\?choices\[0\]/);
   assert.match(css,/\.tvMode\.stage\{padding:0/);
   assert.match(css,/\.tvMode \.nav\{left:0;right:auto/);
-  assert.match(css,/outline:4px solid #20c8ff/);
+  assert.match(css,/outline:3px solid var\(--accent\)/);
   assert.match(css,/\.phone\{padding-bottom:112px\}\.nav\{bottom:40px\}\.fab\{bottom:112px\}/);
 });
 

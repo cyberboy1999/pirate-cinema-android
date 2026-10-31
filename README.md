@@ -24,7 +24,7 @@ Pirate Cinema Android — локальное приложение для пои�
 ### Установка
 
 1. Откройте [Releases](https://github.com/cyberboy1999/pirate-cinema-android/releases).
-2. Скачайте `Pirate-Cinema-Android-0.6.1-arm32-arm64.apk` и при необходимости
+2. Скачайте `Pirate-Cinema-Android-0.6.2-arm32-arm64.apk` и при необходимости
    сравните SHA-256 с `SHA256SUMS`.
 3. Разрешите установку из выбранного браузера или файлового менеджера.
 4. Установите любой внешний видеоплеер. Контейнеры, кодеки, дорожки и управление
@@ -127,7 +127,7 @@ in the APK; no TorrServer instance or cloud account is required.
 ### Installation
 
 1. Open [Releases](https://github.com/cyberboy1999/pirate-cinema-android/releases).
-2. Download `Pirate-Cinema-Android-0.6.1-arm32-arm64.apk` and optionally verify
+2. Download `Pirate-Cinema-Android-0.6.2-arm32-arm64.apk` and optionally verify
    it against `SHA256SUMS`.
 3. Allow installation from the browser or file manager you used.
 4. Install an external video player. Container, codec, track and remote-control
